@@ -1,0 +1,434 @@
+From 95492423a51ec7e8390103f66d79b1d98cf5a709 Mon Sep 17 00:00:00 2001
+From: WXizhi <yvonnewxz826@163.com>
+Date: Tue, 10 Feb 2026 16:38:51 +0800
+Subject: [PATCH] Add megatron-traceviz support
+
+---
+ megatron/training/profile_parallel_state.py | 307 ++++++++++++++++++++
+ megatron/training/training.py               |  48 ++-
+ 2 files changed, 347 insertions(+), 8 deletions(-)
+ create mode 100644 megatron/training/profile_parallel_state.py
+
+diff --git a/megatron/training/profile_parallel_state.py b/megatron/training/profile_parallel_state.py
+new file mode 100644
+index 000000000..4749897e7
+--- /dev/null
++++ b/megatron/training/profile_parallel_state.py
+@@ -0,0 +1,307 @@
++import os
++import json
++import torch
++import torch.distributed as dist
++from megatron.core import parallel_state
++from .global_vars import get_args
++import datetime
++from collections import defaultdict
++
++
++def save_parallel_groups_info(log_dir):
++    """Collect and save all parallel group information."""
++    if not dist.is_initialized():
++        return
++    
++    current_rank = dist.get_rank()
++    world_size = dist.get_world_size()
++    
++    rank_parallel_info = collect_current_rank_parallel_info(current_rank)
++    all_ranks_parallel_info = [None] * world_size
++    dist.all_gather_object(all_ranks_parallel_info, rank_parallel_info)
++    
++    if current_rank == 0:
++        try:
++            analysis_result = analyze_parallel_groups(all_ranks_parallel_info)
++            
++            try:
++                full_model_groups = build_full_model_rank_groups()
++                analysis_result["full_model_groups"] = full_model_groups
++            except Exception as e:
++                print(f"Warning: Failed to build full model rank groups: {e}")
++                analysis_result["full_model_groups"] = None
++            
++            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
++            filename = f"unique_parallel_groups_{timestamp}.txt"
++            filepath = os.path.join(log_dir, filename)
++            
++            os.makedirs(log_dir, exist_ok=True)
++            save_unique_groups_to_file(filepath, analysis_result, get_args())
++            
++        except Exception as e:
++            print(f"Error saving parallel groups info: {e}")
++
++
++def collect_current_rank_parallel_info(current_rank):
++    """Collect parallel group information for the current rank."""
++    rank_info = {
++        "global_rank": current_rank,
++        "tp_global_ranks": None,
++        "dp_global_ranks": None,
++        "pp_global_ranks": None,
++        "ep_global_ranks": None,
++        "error": None
++    }
++    
++    try:
++        # TP Group
++        if hasattr(parallel_state, '_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS'):
++            tp_ranks = parallel_state._TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
++            if tp_ranks is not None:
++                rank_info["tp_global_ranks"] = list(tp_ranks)
++        
++        # PP Group
++        if hasattr(parallel_state, '_PIPELINE_GLOBAL_RANKS'):
++            pp_ranks = parallel_state._PIPELINE_GLOBAL_RANKS
++            if pp_ranks is not None:
++                rank_info["pp_global_ranks"] = list(pp_ranks)
++        
++        # DP Group (Standard Data Parallel)
++        if hasattr(parallel_state, '_DATA_PARALLEL_GLOBAL_RANKS'):
++            dp_ranks = parallel_state._DATA_PARALLEL_GLOBAL_RANKS
++            if dp_ranks is not None:
++                rank_info["dp_global_ranks"] = list(dp_ranks)
++        
++        # EP Group
++        try:
++            # Check if EP size is greater than 1
++            ep_size = 0
++            if hasattr(parallel_state, 'get_expert_model_parallel_world_size'):
++                 ep_size = parallel_state.get_expert_model_parallel_world_size()
++            
++            if ep_size > 1:
++                # Method 1: Check for explicit global ranks
++                if hasattr(parallel_state, '_EXPERT_MODEL_PARALLEL_RANKS'):
++                     ep_ranks = parallel_state._EXPERT_MODEL_PARALLEL_RANKS
++                     if ep_ranks is not None:
++                         rank_info["ep_global_ranks"] = list(ep_ranks)
++                
++                # Method 2: Infer from EP group object if direct list is missing
++                elif hasattr(parallel_state, '_EXPERT_MODEL_PARALLEL_GROUP'):
++                    ep_group = parallel_state._EXPERT_MODEL_PARALLEL_GROUP
++                    if ep_group is not None:
++                        # Assuming contiguous ranks for EP groups within the block
++                        # Note: This inference depends heavily on initialization order
++                        ep_rank = parallel_state.get_expert_model_parallel_rank()
++                        # Simple inference: [current - ep_rank, ..., current + (size - 1 - ep_rank)]
++                        ep_ranks = [current_rank - ep_rank + i for i in range(ep_size)]
++                        rank_info["ep_global_ranks"] = ep_ranks
++        except Exception:
++            pass
++            
++    except Exception as e:
++        rank_info["error"] = f"Error collecting parallel info: {e}"
++    
++    return rank_info
++
++
++def analyze_parallel_groups(all_ranks_parallel_info):
++    """Analyze gathered parallel info to extract unique groups."""
++    analysis = {
++        "unique_tp_groups": set(),
++        "unique_pp_groups": set(),
++        "unique_dp_groups": set(),
++        "unique_ep_groups": set(),
++        "total_ranks": len(all_ranks_parallel_info),
++        "valid_ranks": 0,
++        "error_ranks": []
++    }
++    
++    for rank_info in all_ranks_parallel_info:
++        if not rank_info:
++            continue
++            
++        if rank_info.get("error"):
++            analysis["error_ranks"].append({
++                "rank": rank_info["global_rank"],
++                "error": rank_info["error"]
++            })
++            continue
++        
++        analysis["valid_ranks"] += 1
++        
++        for group_type in ["tp", "pp", "dp", "ep"]:
++            ranks = rank_info.get(f"{group_type}_global_ranks")
++            if ranks:
++                analysis[f"unique_{group_type}_groups"].add(tuple(sorted(ranks)))
++    
++    for group_type in ["tp", "pp", "dp", "ep"]:
++        analysis[f"unique_{group_type}_groups"] = sorted([
++            list(group) for group in analysis[f"unique_{group_type}_groups"]
++        ])
++    
++    return analysis
++
++
++def build_full_model_rank_groups():
++    """
++    Construct full model replica groups.
++    
++    Concept: A "Full Model" contains all model shards (TP/EP/PP/CP).
++    - Without EP: Full Model = TP * PP * CP
++    - With EP: Full Model = TP * EP * PP * CP
++    
++    The DP dimension represents the number of model replicas.
++    """
++    world_size = dist.get_world_size()
++    
++    # Get parallel configuration sizes
++    tp_size = parallel_state.get_tensor_model_parallel_world_size()
++    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
++    cp_size = parallel_state.get_context_parallel_world_size()
++    
++    # Get expert configuration sizes
++    try:
++        ep_size = parallel_state.get_expert_model_parallel_world_size()
++        try:
++            expert_tp_size = parallel_state.get_expert_tensor_parallel_world_size()
++        except AttributeError:
++            # Fallback to standard TP size if expert TP size function is missing
++            expert_tp_size = tp_size
++    except:
++        ep_size = 1
++        expert_tp_size = tp_size
++    
++    # Calculate DP size based on model configuration
++    if ep_size > 1:
++        # With Expert Parallelism
++        expert_tensor_model_pipeline_size = expert_tp_size * ep_size * pp_size
++        dp_size = world_size // expert_tensor_model_pipeline_size
++        
++        full_model_groups = defaultdict(list)
++        
++        for global_rank in range(world_size):
++            # Decompose rank based on order='tp-cp-ep-dp-pp'
++            tp_r, cp_r, ep_r, dp_r, pp_r = _decompose_rank_by_order(
++                global_rank, expert_tp_size, 1, ep_size, dp_size, pp_size,
++                order='tp-cp-ep-dp-pp'
++            )
++            # Group by DP rank - each DP rank corresponds to one full model replica
++            full_model_groups[dp_r].append(global_rank)
++    else:
++        # Without Expert Parallelism
++        model_size = tp_size * cp_size * pp_size
++        dp_size = world_size // model_size
++        
++        full_model_groups = defaultdict(list)
++        
++        for global_rank in range(world_size):
++            # Decompose rank based on order='tp-cp-ep-dp-pp'
++            tp_r, cp_r, ep_r, dp_r, pp_r = _decompose_rank_by_order(
++                global_rank, tp_size, cp_size, 1, dp_size, pp_size,
++                order='tp-cp-ep-dp-pp'
++            )
++            full_model_groups[dp_r].append(global_rank)
++    
++    return {dp_rank: sorted(ranks) for dp_rank, ranks in full_model_groups.items()}
++
++
++def _decompose_rank_by_order(global_rank, tp_size, cp_size, ep_size, dp_size, pp_size, 
++                              order='tp-cp-ep-dp-pp'):
++    """Decompose global_rank into parallel coordinates based on the specified order."""
++    remaining = global_rank
++    dim_sizes = {'tp': tp_size, 'cp': cp_size, 'ep': ep_size, 'dp': dp_size, 'pp': pp_size}
++    ranks_dict = {}
++    
++    # Iterate through dimensions in reverse order (least significant first logic for modulo)
++    # The split order implies the stride structure
++    for dim in order.split('-'):
++        size = dim_sizes[dim]
++        if size > 0:
++            ranks_dict[dim] = remaining % size
++            remaining //= size
++        else:
++            ranks_dict[dim] = 0
++    
++    return (ranks_dict.get('tp', 0), ranks_dict.get('cp', 0), ranks_dict.get('ep', 0), 
++            ranks_dict.get('dp', 0), ranks_dict.get('pp', 0))
++
++
++def save_unique_groups_to_file(filepath, analysis, args):
++    """Save all parallel group information to a text file."""
++    with open(filepath, 'w') as f:
++        f.write("=" * 80 + "\n")
++        f.write("MEGATRON PARALLEL CONFIGURATION\n")
++        f.write("=" * 80 + "\n")
++        f.write(f"Timestamp: {datetime.datetime.now()}\n")
++        f.write(f"TP Size: {getattr(args, 'tensor_model_parallel_size', 'N/A')}\n")
++        f.write(f"PP Size: {getattr(args, 'pipeline_model_parallel_size', 'N/A')}\n")
++        f.write(f"CP Size: {getattr(args, 'context_parallel_size', 1)}\n")
++        f.write(f"EP Size: {getattr(args, 'expert_model_parallel_size', 'N/A')}\n")
++        f.write(f"World Size: {getattr(args, 'world_size', 'N/A')}\n\n")
++        f.write(f"Global Batch Size: {getattr(args, 'global_batch_size', 'N/A')}\n\n")
++        
++        f.write("STATISTICS\n")
++        f.write("-" * 50 + "\n")
++        f.write(f"Total Ranks: {analysis['total_ranks']}\n")
++        f.write(f"Valid Ranks: {analysis['valid_ranks']}\n")
++        f.write(f"Error Ranks: {len(analysis['error_ranks'])}\n\n")
++        
++        _write_group_section(f, "TENSOR PARALLEL (TP) GROUPS", analysis["unique_tp_groups"])
++        _write_group_section(f, "PIPELINE PARALLEL (PP) GROUPS", analysis["unique_pp_groups"])
++        _write_group_section(f, "DATA PARALLEL (DP) GROUPS", analysis["unique_dp_groups"])
++        
++        # Only write EP groups if they exist
++        if analysis["unique_ep_groups"]:
++            _write_group_section(f, "EXPERT PARALLEL (EP) GROUPS", analysis["unique_ep_groups"])
++        
++        _write_full_model_groups(f, analysis, args)
++        
++        if analysis["error_ranks"]:
++            f.write("ERROR INFORMATION\n")
++            f.write("-" * 50 + "\n")
++            for error_info in analysis["error_ranks"]:
++                f.write(f"Rank {error_info['rank']}: {error_info['error']}\n")
++            f.write("\n")
++
++
++def _write_group_section(f, title, groups):
++    """Write a section of group information to the file."""
++    f.write(f"{title}\n")
++    f.write("-" * 50 + "\n")
++    if groups:
++        for i, group in enumerate(groups, 1):
++            f.write(f"Group {i}: {group}\n")
++        f.write(f"Total groups: {len(groups)}\n")
++    else:
++        f.write("No groups found.\n")
++    f.write("\n")
++
++
++def _write_full_model_groups(f, analysis, args):
++    """Write full model replica group information."""
++    f.write("FULL MODEL RANK GROUPS (by DP Rank)\n")
++    f.write("-" * 50 + "\n")
++    f.write("Each DP rank contains ONE complete model replica with ALL shards.\n")
++    tp_size = getattr(args, "tensor_model_parallel_size", 1)
++    pp_size = getattr(args, "pipeline_model_parallel_size", 1)
++    ep_size = getattr(args, "expert_model_parallel_size", 1)
++    cp_size = getattr(args, "context_parallel_size", 1)
++    expected_size = tp_size * pp_size * ep_size * cp_size
++    f.write(f"Full model = TP{tp_size} x EP{ep_size} x PP{pp_size} x CP{cp_size} = {expected_size} ranks\n")
++    f.write("-" * 50 + "\n")
++    
++    full_model_groups = analysis.get("full_model_groups")
++    
++    if full_model_groups is None:
++        f.write("⚠️ Full model groups not available.\n\n")
++        return
++    
++    if not full_model_groups:
++        f.write("No full model groups found.\n\n")
++        return
++    
++    for dp_rank in sorted(full_model_groups.keys()):
++        ranks = full_model_groups[dp_rank]
++        f.write(f"Group {dp_rank}: {ranks}\n")     
++    f.write(f"\nTotal model replicas (DP): {len(full_model_groups)}\n")
+\ No newline at end of file
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index d2fa32c00..d2c9997b0 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -818,6 +818,10 @@ def pretrain(
+     args = get_args()
+     timers = get_timers()
+ 
++    if args.tensorboard_dir:
++        from megatron.training.profile_parallel_state import save_parallel_groups_info
++        save_parallel_groups_info(args.tensorboard_dir)
++
+     if args.fine_grained_activation_offloading:
+         from megatron.core.pipeline_parallel.utils import (
+             set_ideal_affinity_for_current_gpu
+@@ -2308,6 +2312,7 @@ def post_training_step_callbacks(
+     iteration,
+     prof,
+     num_floating_point_operations_since_last_log_event,
++    profile_ranks,
+     nsys_nvtx_context = None,
+ ):
+     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
+@@ -2346,7 +2351,7 @@ def post_training_step_callbacks(
+     if (
+         args.profile
+         and iteration == args.profile_step_end
+-        and torch.distributed.get_rank() in args.profile_ranks
++        and torch.distributed.get_rank() in profile_ranks
+     ):
+         if args.use_pytorch_profiler:
+             assert prof is not None
+@@ -2692,24 +2697,50 @@ def train(
+     if one_logger:
+         with one_logger.get_context_manager():
+             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
++    
++    is_profile_all = os.getenv('PROFILE_ALLRANKS', '').lower()
++    if is_profile_all in ['true', '1', 'yes', 'on']:
++        # Environment variable exists, profile all ranks
++        profile_ranks = list(range(torch.distributed.get_world_size()))
++    else:
++        # Use the original args.profile_ranks logic
++        profile_ranks = args.profile_ranks
+ 
+     prof = None
+     nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
+     if (
+         args.profile
+-        and torch.distributed.get_rank() in args.profile_ranks
++        and torch.distributed.get_rank() in profile_ranks
+         and args.use_pytorch_profiler
+     ):
++        def trace_handler(prof):
++            curr_trace_dir_name = "iteration_" + str(iteration)
++            curr_trace_dir = os.path.join(args.tensorboard_dir, curr_trace_dir_name)
++            
++            if not os.path.exists(curr_trace_dir):
++                os.makedirs(curr_trace_dir, exist_ok=True)
++            
++            curr_rank = torch.distributed.get_rank()
++            curr_trace_path = os.path.join(curr_trace_dir, f"rank_{curr_rank:04d}_iter_{iteration}.pt.trace.json")
++            # Export the trace
++            prof.export_chrome_trace(curr_trace_path)
++            return
++
++        # Get steps configuration from environment variables
++        wait_steps = int(os.getenv("PROFILER_WAIT_STEPS", 10))
++        warmup_steps = int(os.getenv("PROFILER_WARMUP_STEPS", 3))
++
+         prof = torch.profiler.profile(
+             schedule=torch.profiler.schedule(
+-                wait=max(args.profile_step_start - 1, 0),
+-                warmup=1 if args.profile_step_start > 0 else 0,
+-                active=args.profile_step_end - args.profile_step_start,
+-                repeat=1,
++                wait=max(wait_steps, 0),  # Control profiling frequency (wait steps)
++                warmup=warmup_steps, # Fixed warmup steps
++                active=1,  # Record only 1 step per cycle
++                repeat=0   # 0 means stop after one cycle (Wait->Warmup->Active->Stop)
+             ),
+-            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
++            on_trace_ready=trace_handler,
+             record_shapes=True,
+             with_stack=True,
++            activities=[torch.profiler.ProfilerActivity.CPU,torch.profiler.ProfilerActivity.CUDA],
+         )
+         prof.start()
+ 
+@@ -2745,7 +2776,7 @@ def train(
+     # Run training iterations till done.
+     buffered_rollouts = None
+     while iteration < args.train_iters:
+-        if args.profile and torch.distributed.get_rank() in args.profile_ranks:
++        if args.profile and torch.distributed.get_rank() in profile_ranks:
+             if args.use_pytorch_profiler:
+                 prof.step()
+             elif iteration == args.profile_step_start:
+@@ -3046,6 +3077,7 @@ def train(
+             iteration,
+             prof,
+             num_floating_point_operations_since_last_log_event,
++            profile_ranks,
+             nsys_nvtx_context,
+         )
+ 
+-- 
+2.44.0.windows.1
+
