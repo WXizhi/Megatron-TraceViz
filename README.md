@@ -75,7 +75,7 @@ python aggregator.py --base-folder "/path/to/profile_data" --iterations "iterati
 ### 3.4 Visualization Outputs
 The `aggregator.py` script generates a structured hierarchy of visualization folders. Below is a guide to the key output artifacts you can find in the results directory:
 
-* **[📂 Rank-Level Analysis](./result_figs/rank4.1767595720694.pt.trace_kernel_analysis/)**
+* **[Rank-Level Analysis](./result_figs/rank4.1767595720694.pt.trace_kernel_analysis/)**
     * Contains analysis artifacts for individual ranks.
     * `overlapping_timeline.png`: A timeline visualization where different kernel categories (e.g., computation, communication) are aligned by Wall Clock Time, grouped by the micro-batch step (MBS) they belong to.
     * `comm_comp_overlap_combined_rankX.png`: A bar chart analysis quantifying the latency of computation, communication, and their overlap for each MBS.
