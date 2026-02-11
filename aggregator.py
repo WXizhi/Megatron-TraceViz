@@ -275,11 +275,37 @@ def process_model_groups(root_dir: str, complete_model_groups_with_paths: Dict[i
                 pp_group_images.append(out_path)
         
         if pp_group_images:
+            _concatenate_images_vertically(pp_group_images, os.path.join(output_dir, f'Model_Group_{model_group_id}_all_pp_groups_concatenated.png'))
             visualizer.plot_combined_timeline(full_multirank_data, 
                 os.path.join(output_dir, f'Model_Group_{model_group_id}_all_ranks_combined.png'),
                 time_alignment=time_alignment,
                 category_order=['optimizer_computation', 'dp_communication', 'fwd_computation', 'bwd_computation'],
                 title=f'Model Group {model_group_id} - All Ranks Combined ({len(all_model_ranks)} ranks)')
+
+def _concatenate_images_vertically(image_paths: List[str], output_path: str):
+    """Concatenate images vertically."""
+    try:
+        from PIL import Image
+    except ImportError:
+        import subprocess; subprocess.check_call([sys.executable, "-m", "pip", "install", "Pillow"])
+        from PIL import Image
+    
+    images = [Image.open(p) for p in image_paths if os.path.exists(p)]
+    if not images: return
+    
+    max_width = max(img.width for img in images)
+    total_height = sum(img.height for img in images)
+    concatenated = Image.new('RGB', (max_width, total_height), (255, 255, 255))
+    
+    current_y = 0
+    for img in images:
+        concatenated.paste(img, ((max_width - img.width) // 2, current_y))
+        current_y += img.height
+    
+    concatenated.save(output_path, dpi=(300, 300), quality=95)
+    print(f"   ✓ Concatenated image saved: {os.path.basename(output_path)}")
+    for img in images: img.close()
+
 
 def process_rank_aggregation(input_root: str, files: Optional[List[str]] = None, time_alignment: str = 'global',processes=10) -> int:
     """Process rank aggregation analysis and visualization."""
