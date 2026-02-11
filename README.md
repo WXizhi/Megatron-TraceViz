@@ -26,8 +26,9 @@ The primary engine for parsing and categorizing individual trace files. It uses 
 ### 2.3 Running Demos
 Both `core_analyzer.py` and `batch_analyzer.py` feature `main()` functions for standalone execution.
 
+
 > [!NOTE]
-> **Data Access:** Raw `.trace.json` files are not included due to large sizes. Please contact the author for sample trace data to test these demos, or refer to the **Megatron Patch** instructions to generate trace files on your own.
+> **Data Access:** Raw `.trace.json` files are **not included** in this repository due to large sizes. To test these demos, please contact the author for sample data or follow the [**Megatron Patch**](./megatron-patch) instructions to generate your own trace files.
 
 #### Single Trace Analysis
 Use this for analyzing a specific rank's trace file.
